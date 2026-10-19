@@ -5,11 +5,11 @@ import json
 import os
 from collections import defaultdict
 from copy import deepcopy
-from functools import partial
 from json import JSONEncoder
 from typing import Any
 
 import pydantic
+from google.protobuf import json_format
 from google.protobuf.descriptor import FieldDescriptor
 from google.protobuf.duration_pb2 import Duration
 from google.protobuf.json_format import MessageToDict, ParseDict
@@ -29,84 +29,36 @@ _PROTOBUF_INT64_FIELDS = [
 from mlflow.protos.databricks_pb2 import BAD_REQUEST
 
 
-def _mark_int64_fields_for_proto_maps(proto_map, value_field_type):
-    """Converts a proto map to JSON, preserving only int64-related fields."""
-    json_dict = {}
-    for key, value in proto_map.items():
-        # The value of a protobuf map can only be a scalar or a message (not a map or repeated
-        # field).
-        if value_field_type == FieldDescriptor.TYPE_MESSAGE:
-            json_dict[key] = _mark_int64_fields(value)
-        elif value_field_type in _PROTOBUF_INT64_FIELDS:
-            json_dict[key] = int(value)
-        elif isinstance(key, int):
-            json_dict[key] = value
-    return json_dict
+class _Int64NumberJsonPrinter(json_format._Printer):
+    _convert_int64_to_number = True
 
+    def _FieldToJsonObject(self, field, value):
+        if field.is_extension:
+            # The previous merge left the entire extension subtree unchanged.
+            convert_int64_to_number = self._convert_int64_to_number
+            self._convert_int64_to_number = False
+            try:
+                return super()._FieldToJsonObject(field, value)
+            finally:
+                self._convert_int64_to_number = convert_int64_to_number
 
-def _mark_int64_fields(proto_message):
-    """Converts a proto message to JSON, preserving only int64-related fields."""
-    json_dict = {}
-    for field, value in proto_message.ListFields():
+        # Wrappers retained ProtoJSON's string encoding in the previous path.
         if (
-            # These three conditions check if this field is a protobuf map.
-            # See the official implementation: https://bit.ly/3EMx1rl
-            field.type == FieldDescriptor.TYPE_MESSAGE
-            and field.message_type.has_options
-            and field.message_type.GetOptions().map_entry
+            self._convert_int64_to_number
+            and field.type in _PROTOBUF_INT64_FIELDS
+            and field.containing_type.file.name != "google/protobuf/wrappers.proto"
         ):
-            # Deal with proto map fields separately in another function.
-            json_dict[field.name] = _mark_int64_fields_for_proto_maps(
-                value, field.message_type.fields_by_name["value"].type
-            )
-            continue
+            return int(value)
+        return super()._FieldToJsonObject(field, value)
 
-        if field.type == FieldDescriptor.TYPE_MESSAGE:
-            ftype = partial(_mark_int64_fields)
-        elif field.type in _PROTOBUF_INT64_FIELDS:
-            ftype = int
-        else:
-            # Skip all non-int64 fields.
-            continue
-
-        # Use is_repeated property (preferred) with fallback to deprecated label
+    def _AnyMessageToJsonObject(self, message):
+        # Keep packed Any messages in ProtoJSON's standard int64 representation.
+        convert_int64_to_number = self._convert_int64_to_number
+        self._convert_int64_to_number = False
         try:
-            is_repeated = field.is_repeated
-        except AttributeError:
-            is_repeated = field.label == FieldDescriptor.LABEL_REPEATED
-
-        json_dict[field.name] = [ftype(v) for v in value] if is_repeated else ftype(value)
-    return json_dict
-
-
-def _merge_json_dicts(from_dict, to_dict):
-    """Merges the json elements of from_dict into to_dict. Only works for json dicts
-    converted from proto messages
-    """
-    for key, value in from_dict.items():
-        if isinstance(key, int) and str(key) in to_dict:
-            # When the key (i.e. the proto field name) is an integer, it must be a proto map field
-            # with integer as the key. For example:
-            # from_dict is {'field_map': {1: '2', 3: '4'}}
-            # to_dict is {'field_map': {'1': '2', '3': '4'}}
-            # So we need to replace the str keys with int keys in to_dict.
-            to_dict[key] = to_dict[str(key)]
-            del to_dict[str(key)]
-
-        if key not in to_dict:
-            continue
-
-        if isinstance(value, dict):
-            _merge_json_dicts(from_dict[key], to_dict[key])
-        elif isinstance(value, list):
-            for i, v in enumerate(value):
-                if isinstance(v, dict):
-                    _merge_json_dicts(v, to_dict[key][i])
-                else:
-                    to_dict[key][i] = v
-        else:
-            to_dict[key] = from_dict[key]
-    return to_dict
+            return super()._AnyMessageToJsonObject(message)
+        finally:
+            self._convert_int64_to_number = convert_int64_to_number
 
 
 def message_to_json(
@@ -117,13 +69,14 @@ def message_to_json(
 ):
     """Converts a message to JSON, using snake_case for field names."""
 
-    # Google's MessageToDict API converts int64 proto fields to JSON strings.
-    # For more info, see https://github.com/protocolbuffers/protobuf/issues/2954
-    json_dict = MessageToDict(message, preserving_proto_field_name=True)
+    # The standard protobuf printer encodes int64 fields as strings. MLflow emits ordinary
+    # int64 fields as numbers, so convert them during the printer's traversal.
     if convert_int64_to_number:
-        # Preserve MLflow's existing JSON representation of int64 fields as numbers.
-        # Integer keys in proto maps remain strings because JSON requires string keys.
-        json_dict = _merge_json_dicts(_mark_int64_fields(message), json_dict)
+        json_dict = _Int64NumberJsonPrinter(preserving_proto_field_name=True)._MessageToJsonObject(
+            message
+        )
+    else:
+        json_dict = MessageToDict(message, preserving_proto_field_name=True)
 
     if pretty:
         return json.dumps(json_dict, indent=2)

@@ -5,13 +5,20 @@ import json
 import numpy as np
 import pandas as pd
 import pytest
+from google.protobuf import descriptor_pb2, descriptor_pool
+from google.protobuf.any_pb2 import Any as ProtoAny
+from google.protobuf.descriptor_pb2 import MethodOptions
+from google.protobuf.json_format import MessageToDict
 from google.protobuf.text_format import Parse as ParseTextIntoProto
+from google.protobuf.wrappers_pb2 import Int64Value
 
 from mlflow.entities import Experiment, Metric
 from mlflow.entities.model_registry import ModelVersion, RegisteredModel
 from mlflow.exceptions import MlflowException
+from mlflow.protos.databricks_pb2 import rpc
 from mlflow.protos.model_registry_pb2 import RegisteredModel as ProtoRegisteredModel
 from mlflow.protos.service_pb2 import Experiment as ProtoExperiment
+from mlflow.protos.service_pb2 import GetTrace
 from mlflow.protos.service_pb2 import Metric as ProtoMetric
 from mlflow.types import ColSpec, DataType, Schema, TensorSpec
 from mlflow.types.schema import Array, Map, Object, Property
@@ -228,7 +235,6 @@ def test_message_to_json():
         },
         "[mlflow.ExtensionMessage.field_extended_int64]": "100",
     }
-
     json_with_int64_strings = json.loads(
         message_to_json(test_message, convert_int64_to_number=False)
     )
@@ -237,6 +243,76 @@ def test_message_to_json():
     new_test_message = SampleMessage()
     parse_dict(json_dict, new_test_message)
     assert new_test_message == test_message
+
+
+def test_message_to_json_preserves_special_protobuf_types():
+    assert json.loads(message_to_json(Int64Value(value=42))) == "42"
+    any_message = ProtoAny()
+    any_message.Pack(SampleMessage(field_int64=42))
+    assert json.loads(message_to_json(any_message)) == {
+        "@type": "type.googleapis.com/mlflow.SampleMessage",
+        "field_int64": "42",
+    }
+
+
+def test_message_to_json_preserves_int64_in_message_extension():
+    message = MethodOptions()
+    message.Extensions[rpc].rate_limit.max_burst = 42
+    assert json.loads(message_to_json(message)) == {
+        "[mlflow.rpc]": {"rate_limit": {"max_burst": "42"}}
+    }
+
+
+def test_message_to_json_preserves_repeated_int64_extension():
+    proto = descriptor_pb2.FileDescriptorProto()
+    proto.name = "test_repeated_int64_extension.proto"
+    proto.package = "mlflow"
+    proto.syntax = "proto2"
+    proto.dependency.append("test_message.proto")
+    field = proto.extension.add()
+    field.name = "field_extended_repeated_int64"
+    field.extendee = ".mlflow.SampleMessage"
+    field.number = 1002
+    field.label = descriptor_pb2.FieldDescriptorProto.LABEL_REPEATED
+    field.type = descriptor_pb2.FieldDescriptorProto.TYPE_INT64
+    descriptor = descriptor_pool.Default().AddSerializedFile(proto.SerializeToString())
+    extension = descriptor.extensions_by_name[field.name]
+
+    message = SampleMessage()
+    message.Extensions[extension].extend([42, 2**53 + 1])
+    # Protobuf 3 and newer versions use different JSON keys for repeated extensions.
+    expected = MessageToDict(message, preserving_proto_field_name=True)
+    assert list(expected.values()) == [["42", str(2**53 + 1)]]
+    assert json.loads(message_to_json(message)) == expected
+
+
+@pytest.mark.parametrize("value", [-(2**63), -(2**53 + 1), 2**53 + 1, 2**53 + 2, 2**63 - 1])
+def test_message_to_json_preserves_int64_numbers_at_precision_boundary(value):
+    assert json.loads(message_to_json(SampleMessage(field_int64=value))) == {"field_int64": value}
+
+
+def test_message_to_json_complete_trace_int64_numbers():
+    response = GetTrace.Response()
+    span = response.trace.spans.add()
+    span.start_time_unix_nano = 1234567890123456789
+    span.end_time_unix_nano = 1234567890123456799
+    span.events.add().time_unix_nano = 1234567890123456790
+    attribute = span.attributes.add()
+    attribute.key = "count"
+    attribute.value.int_value = 42
+
+    assert json.loads(message_to_json(response, pretty=False)) == {
+        "trace": {
+            "spans": [
+                {
+                    "start_time_unix_nano": 1234567890123456789,
+                    "end_time_unix_nano": 1234567890123456799,
+                    "events": [{"time_unix_nano": 1234567890123456790}],
+                    "attributes": [{"key": "count", "value": {"int_value": 42}}],
+                }
+            ]
+        }
+    }
 
 
 def test_parse_dict():
