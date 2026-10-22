@@ -84,7 +84,7 @@ export {
   isSessionLevelAssessment,
 } from './ModelTraceExplorer.utils';
 export { CompareModelTraceExplorer } from './CompareModelTraceExplorer';
-export { useGetTracesById } from './hooks/useGetTracesById';
+export { useGetTracesById, GET_TRACE_BY_ID } from './hooks/useGetTracesById';
 export {
   ModelTraceExplorerContextProvider,
   useModelTraceExplorerContext,
